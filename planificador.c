@@ -15,6 +15,7 @@
 #define MAX_DEPENDENCIAS 100
 #define MAX_ID 50
 #define MAX_NOMBRE 100
+#define MAX_LINEA 8192
 #define MAX_MENSAJE 256
 
 #define PENDIENTE 0
@@ -27,15 +28,32 @@ typedef struct {
     char id[MAX_ID];
     char nombre[MAX_NOMBRE];
     int tiempo;
-    char dependencias[MAX_DEPENDENCIAS][MAX_ID];
-    int cant_dependencias;
+
+    char dep_id[MAX_DEPENDENCIAS][MAX_ID];
+    int deps[MAX_DEPENDENCIAS];
+    int cant_deps;
+    int faltan;
+
     int estado;
     pid_t pid;
-    int fd[2];
 } Actividad;
 
+typedef struct {
+    int destino;
+    int siguiente;
+} Arista;
+
 Actividad actividades[MAX_ACTIVIDADES];
+
+Arista *aristas = NULL;
+int *primera_arista = NULL;
+
+int cola[MAX_ACTIVIDADES];
+int inicio_cola = 0;
+int fin_cola = 0;
+
 int cantidad = 0;
+int cant_aristas = 0;
 
 volatile sig_atomic_t ctrl_c = 0;
 
@@ -50,19 +68,19 @@ char *limpiar(char *texto) {
         return texto;
     }
 
-    char *final = texto + strlen(texto) - 1;
+    char *fin = texto + strlen(texto) - 1;
 
-    while (final > texto && isspace((unsigned char)*final)) {
-        final--;
+    while (fin > texto && isspace((unsigned char)*fin)) {
+        fin--;
     }
 
-    final[1] = '\0';
+    fin[1] = '\0';
 
     return texto;
 }
 
 
-// busca una actividad por su id
+// busca una actividad por id
 int buscar_id(const char *id) {
     for (int i = 0; i < cantidad; i++) {
         if (strcmp(actividades[i].id, id) == 0) {
@@ -74,7 +92,7 @@ int buscar_id(const char *id) {
 }
 
 
-// busca una actividad usando el pid
+// busca una actividad por pid
 int buscar_pid(pid_t pid) {
     for (int i = 0; i < cantidad; i++) {
         if (actividades[i].pid == pid) {
@@ -86,7 +104,25 @@ int buscar_pid(pid_t pid) {
 }
 
 
-// lee las actividades desde plan.txt
+// agrega una actividad a la cola de listas
+void agregar_cola(int pos) {
+    if (fin_cola < MAX_ACTIVIDADES) {
+        cola[fin_cola++] = pos;
+    }
+}
+
+
+// saca una actividad de la cola
+int sacar_cola(void) {
+    if (inicio_cola >= fin_cola) {
+        return -1;
+    }
+
+    return cola[inicio_cola++];
+}
+
+
+// lee el archivo plan.txt
 void leer_plan(const char *nombre_archivo) {
     FILE *archivo = fopen(nombre_archivo, "r");
 
@@ -95,7 +131,7 @@ void leer_plan(const char *nombre_archivo) {
         exit(EXIT_FAILURE);
     }
 
-    char linea[4096];
+    char linea[MAX_LINEA];
 
     while (fgets(linea, sizeof(linea), archivo) != NULL) {
         linea[strcspn(linea, "\r\n")] = '\0';
@@ -148,8 +184,8 @@ void leer_plan(const char *nombre_archivo) {
 
         *p3 = '\0';
 
-        char *tiempo = limpiar(resto);
-        char *deps = limpiar(p3 + 1);
+        char *tiempo_txt = limpiar(resto);
+        char *deps_txt = limpiar(p3 + 1);
 
         if (*id == '\0' || *nombre == '\0') {
             fprintf(stderr, "ID o nombre vacio\n");
@@ -170,12 +206,11 @@ void leer_plan(const char *nombre_archivo) {
         strncpy(a->id, id, MAX_ID - 1);
         strncpy(a->nombre, nombre, MAX_NOMBRE - 1);
 
-        // si no viene tiempo se genera uno
-        if (*tiempo == '\0') {
+        if (*tiempo_txt == '\0') {
             a->tiempo = 100 + rand() % 4901;
         } else {
             char *fin;
-            long valor = strtol(tiempo, &fin, 10);
+            long valor = strtol(tiempo_txt, &fin, 10);
 
             if (*limpiar(fin) != '\0' || valor <= 0) {
                 fprintf(stderr, "Tiempo incorrecto en %s\n", a->id);
@@ -188,15 +223,13 @@ void leer_plan(const char *nombre_archivo) {
 
         a->estado = PENDIENTE;
         a->pid = -1;
-        a->fd[0] = -1;
-        a->fd[1] = -1;
-        a->cant_dependencias = 0;
+        a->cant_deps = 0;
 
-        // guarda las dependencias separadas por coma
-        if (*deps != '\0') {
-            char copia[4096];
+        // guarda primero los id de las dependencias
+        if (*deps_txt != '\0') {
+            char copia[MAX_LINEA];
 
-            strncpy(copia, deps, sizeof(copia) - 1);
+            strncpy(copia, deps_txt, sizeof(copia) - 1);
             copia[sizeof(copia) - 1] = '\0';
 
             char *guardar = NULL;
@@ -206,19 +239,19 @@ void leer_plan(const char *nombre_archivo) {
                 dep = limpiar(dep);
 
                 if (*dep != '\0') {
-                    if (a->cant_dependencias >= MAX_DEPENDENCIAS) {
+                    if (a->cant_deps >= MAX_DEPENDENCIAS) {
                         fprintf(stderr, "Demasiadas dependencias\n");
                         fclose(archivo);
                         exit(EXIT_FAILURE);
                     }
 
                     strncpy(
-                        a->dependencias[a->cant_dependencias],
+                        a->dep_id[a->cant_deps],
                         dep,
                         MAX_ID - 1
                     );
 
-                    a->cant_dependencias++;
+                    a->cant_deps++;
                 }
 
                 dep = strtok_r(NULL, ",", &guardar);
@@ -237,116 +270,149 @@ void leer_plan(const char *nombre_archivo) {
 }
 
 
-// revisa que todas las dependencias existan
-void revisar_dependencias(void) {
+// convierte las dependencias a posiciones numericas
+void preparar_dependencias(void) {
+    int total = 0;
+
     for (int i = 0; i < cantidad; i++) {
-        for (int j = 0; j < actividades[i].cant_dependencias; j++) {
-            char *dep = actividades[i].dependencias[j];
-
-            if (strcmp(dep, actividades[i].id) == 0) {
-                fprintf(
-                    stderr,
-                    "La actividad %s depende de si misma\n",
-                    actividades[i].id
-                );
-
-                exit(EXIT_FAILURE);
-            }
-
-            if (buscar_id(dep) == -1) {
-                fprintf(
-                    stderr,
-                    "La dependencia %s no existe\n",
-                    dep
-                );
-
-                exit(EXIT_FAILURE);
-            }
-        }
-    }
-}
-
-
-// revisa si una actividad ya puede comenzar
-int puede_empezar(int pos) {
-    Actividad *a = &actividades[pos];
-
-    if (a->estado != PENDIENTE) {
-        return 0;
+        total += actividades[i].cant_deps;
     }
 
-    for (int i = 0; i < a->cant_dependencias; i++) {
-        int dep = buscar_id(a->dependencias[i]);
+    aristas = malloc(sizeof(Arista) * (total > 0 ? total : 1));
+    primera_arista = malloc(sizeof(int) * cantidad);
 
-        if (dep == -1) {
-            return 0;
-        }
-
-        if (actividades[dep].estado != TERMINADA) {
-            return 0;
-        }
+    if (aristas == NULL || primera_arista == NULL) {
+        fprintf(stderr, "No hay memoria suficiente\n");
+        exit(EXIT_FAILURE);
     }
 
-    return 1;
-}
-
-
-// aborta las actividades que dependen de una que fallo
-int revisar_abortadas(void) {
-    int cambios = 0;
+    for (int i = 0; i < cantidad; i++) {
+        primera_arista[i] = -1;
+    }
 
     for (int i = 0; i < cantidad; i++) {
         Actividad *a = &actividades[i];
 
-        if (a->estado != PENDIENTE) {
-            continue;
-        }
+        for (int j = 0; j < a->cant_deps; j++) {
+            int dep = buscar_id(a->dep_id[j]);
 
-        for (int j = 0; j < a->cant_dependencias; j++) {
-            int dep = buscar_id(a->dependencias[j]);
-
-            if (dep >= 0 &&
-                (actividades[dep].estado == FALLIDA ||
-                 actividades[dep].estado == ABORTADA)) {
-
-                a->estado = ABORTADA;
-
-                printf(
-                    "[ABORTADA] %s depende de %s\n",
-                    a->nombre,
-                    actividades[dep].nombre
+            if (dep == -1) {
+                fprintf(
+                    stderr,
+                    "La dependencia %s no existe\n",
+                    a->dep_id[j]
                 );
 
-                cambios++;
-                break;
+                exit(EXIT_FAILURE);
             }
+
+            if (dep == i) {
+                fprintf(
+                    stderr,
+                    "La actividad %s depende de si misma\n",
+                    a->id
+                );
+
+                exit(EXIT_FAILURE);
+            }
+
+            a->deps[j] = dep;
+
+            // guarda quien depende de esta actividad
+            aristas[cant_aristas].destino = i;
+            aristas[cant_aristas].siguiente = primera_arista[dep];
+            primera_arista[dep] = cant_aristas;
+
+            cant_aristas++;
         }
+
+        a->faltan = a->cant_deps;
     }
 
-    return cambios;
+    // las que no tienen dependencias pueden partir
+    for (int i = 0; i < cantidad; i++) {
+        if (actividades[i].cant_deps == 0) {
+            agregar_cola(i);
+        }
+    }
 }
 
 
-// solo avisa que se presiono ctrl+c
+// recibe ctrl+c
 void recibir_sigint(int sig) {
     (void)sig;
     ctrl_c = 1;
 }
 
 
-// termina los procesos que siguen funcionando
-void cancelar_todo(void) {
-    printf("\nCtrl+C recibido, cancelando actividades...\n");
+// aborta una rama cuando una actividad falla
+void abortar_rama(int pos) {
+    int arista = primera_arista[pos];
 
-    for (int i = 0; i < cantidad; i++) {
-        if (actividades[i].estado == EJECUTANDO &&
-            actividades[i].pid > 0) {
+    while (arista != -1) {
+        int hijo = aristas[arista].destino;
 
-            kill(actividades[i].pid, SIGTERM);
+        if (actividades[hijo].estado == PENDIENTE) {
+            actividades[hijo].estado = ABORTADA;
+
+            printf(
+                "[ABORTADA] %s depende de %s\n",
+                actividades[hijo].nombre,
+                actividades[pos].nombre
+            );
+
+            abortar_rama(hijo);
         }
 
-        if (actividades[i].estado == PENDIENTE) {
-            actividades[i].estado = ABORTADA;
+        arista = aristas[arista].siguiente;
+    }
+}
+
+
+// avisa a los dependientes que una actividad termino
+void avisar_dependientes(int pos) {
+    int arista = primera_arista[pos];
+
+    while (arista != -1) {
+        int hijo = aristas[arista].destino;
+
+        if (actividades[hijo].estado == PENDIENTE) {
+            actividades[hijo].faltan--;
+
+            if (actividades[hijo].faltan == 0) {
+                agregar_cola(hijo);
+            }
+        }
+
+        arista = aristas[arista].siguiente;
+    }
+}
+
+
+// envia los mensajes de las dependencias por un pipe
+void enviar_insumos(int fd, int pos) {
+    Actividad *a = &actividades[pos];
+
+    for (int i = 0; i < a->cant_deps; i++) {
+        int dep = a->deps[i];
+
+        char mensaje[MAX_MENSAJE];
+
+        int largo = snprintf(
+            mensaje,
+            sizeof(mensaje),
+            "%s termino\n",
+            actividades[dep].nombre
+        );
+
+        if (largo > 0) {
+            if (largo >= MAX_MENSAJE) {
+                largo = MAX_MENSAJE - 1;
+            }
+
+            if (write(fd, mensaje, (size_t)largo) == -1) {
+                break;
+            }
         }
     }
 }
@@ -356,7 +422,9 @@ void cancelar_todo(void) {
 int iniciar_actividad(int pos) {
     Actividad *a = &actividades[pos];
 
-    if (pipe(a->fd) == -1) {
+    int fd[2];
+
+    if (pipe(fd) == -1) {
         perror("pipe");
         return -1;
     }
@@ -366,19 +434,34 @@ int iniciar_actividad(int pos) {
     if (pid < 0) {
         perror("fork");
 
-        close(a->fd[0]);
-        close(a->fd[1]);
-
-        a->fd[0] = -1;
-        a->fd[1] = -1;
+        close(fd[0]);
+        close(fd[1]);
 
         return -1;
     }
 
     if (pid == 0) {
-        close(a->fd[0]);
+        close(fd[1]);
 
-        // sirve para probar el manejo de errores
+        // lee los mensajes que vienen de sus dependencias
+        char buffer[MAX_MENSAJE];
+        ssize_t leidos;
+
+        while ((leidos = read(fd[0], buffer, sizeof(buffer) - 1)) > 0) {
+            buffer[leidos] = '\0';
+
+            printf(
+                "[PIPE -> %s] %s",
+                a->nombre,
+                buffer
+            );
+
+            fflush(stdout);
+        }
+
+        close(fd[0]);
+
+        // se usa solo para probar errores
         char *fallar = getenv("FALLAR_ID");
 
         if (fallar != NULL && strcmp(fallar, a->id) == 0) {
@@ -389,8 +472,6 @@ int iniciar_actividad(int pos) {
             );
 
             fflush(stdout);
-            close(a->fd[1]);
-
             _exit(EXIT_FAILURE);
         }
 
@@ -410,26 +491,9 @@ int iniciar_actividad(int pos) {
 
         while (nanosleep(&espera, &espera) == -1) {
             if (errno != EINTR) {
-                close(a->fd[1]);
                 _exit(EXIT_FAILURE);
             }
         }
-
-        char mensaje[MAX_MENSAJE];
-
-        snprintf(
-            mensaje,
-            sizeof(mensaje),
-            "%s termino",
-            a->nombre
-        );
-
-        if (write(a->fd[1], mensaje, strlen(mensaje) + 1) == -1) {
-            close(a->fd[1]);
-            _exit(EXIT_FAILURE);
-        }
-
-        close(a->fd[1]);
 
         printf(
             "[FIN] PID=%ld | %s\n",
@@ -442,9 +506,12 @@ int iniciar_actividad(int pos) {
         _exit(EXIT_SUCCESS);
     }
 
-    // el padre solo lee el pipe
-    close(a->fd[1]);
-    a->fd[1] = -1;
+    // el padre manda los insumos y cierra el pipe
+    close(fd[0]);
+
+    enviar_insumos(fd[1], pos);
+
+    close(fd[1]);
 
     a->pid = pid;
     a->estado = EJECUTANDO;
@@ -453,8 +520,8 @@ int iniciar_actividad(int pos) {
 }
 
 
-// guarda el resultado de un hijo que termino
-void terminar_actividad(pid_t pid, int status) {
+// procesa un hijo que termino
+void procesar_hijo(pid_t pid, int status) {
     int pos = buscar_pid(pid);
 
     if (pos == -1) {
@@ -463,56 +530,60 @@ void terminar_actividad(pid_t pid, int status) {
 
     Actividad *a = &actividades[pos];
 
-    char mensaje[MAX_MENSAJE];
-
-    ssize_t leidos = read(
-        a->fd[0],
-        mensaje,
-        sizeof(mensaje) - 1
-    );
-
-    if (leidos > 0) {
-        mensaje[leidos] = '\0';
-        printf("[PIPE] %s\n", mensaje);
-    }
-
-    if (a->fd[0] >= 0) {
-        close(a->fd[0]);
-        a->fd[0] = -1;
-    }
+    a->pid = -1;
 
     if (WIFEXITED(status) &&
         WEXITSTATUS(status) == EXIT_SUCCESS) {
 
         a->estado = TERMINADA;
+        avisar_dependientes(pos);
+
     } else {
         a->estado = FALLIDA;
-        printf("[FALLO] %s\n", a->nombre);
-    }
 
-    a->pid = -1;
+        printf("[FALLO] %s\n", a->nombre);
+
+        abortar_rama(pos);
+    }
 }
 
 
-// revisa si ya no queda nada por ejecutar
-int termino_plan(void) {
-    for (int i = 0; i < cantidad; i++) {
-        if (actividades[i].estado == PENDIENTE ||
-            actividades[i].estado == EJECUTANDO) {
+// cancela todo con ctrl+c
+void cancelar_todo(void) {
+    printf("\nCtrl+C recibido, cancelando actividades...\n");
 
-            return 0;
+    for (int i = 0; i < cantidad; i++) {
+        if (actividades[i].estado == EJECUTANDO &&
+            actividades[i].pid > 0) {
+
+            kill(actividades[i].pid, SIGTERM);
+        }
+
+        if (actividades[i].estado == PENDIENTE) {
+            actividades[i].estado = ABORTADA;
+        }
+    }
+}
+
+
+// revisa si quedan actividades pendientes
+int hay_pendientes(void) {
+    for (int i = 0; i < cantidad; i++) {
+        if (actividades[i].estado == PENDIENTE) {
+            return 1;
         }
     }
 
-    return 1;
+    return 0;
 }
 
 
-// parte principal del planificador
+// ejecuta el plan
 void ejecutar_plan(int k) {
     int ejecutando = 0;
+    int terminadas = 0;
 
-    while (!termino_plan()) {
+    while (terminadas < cantidad) {
         if (ctrl_c) {
             cancelar_todo();
 
@@ -524,12 +595,6 @@ void ejecutar_plan(int k) {
 
                 if (pos >= 0) {
                     actividades[pos].estado = ABORTADA;
-
-                    if (actividades[pos].fd[0] >= 0) {
-                        close(actividades[pos].fd[0]);
-                        actividades[pos].fd[0] = -1;
-                    }
-
                     actividades[pos].pid = -1;
                 }
             }
@@ -537,50 +602,67 @@ void ejecutar_plan(int k) {
             return;
         }
 
-        // sigue propagando los fallos si hay mas dependientes
-        while (revisar_abortadas() > 0) {
-        }
+        // inicia las actividades que ya estan listas
+        while (ejecutando < k) {
+            int pos = sacar_cola();
 
-        // inicia actividades hasta llegar al limite k
-        for (int i = 0; i < cantidad && ejecutando < k; i++) {
-            if (puede_empezar(i)) {
-                if (iniciar_actividad(i) == 0) {
-                    ejecutando++;
-                } else {
-                    actividades[i].estado = FALLIDA;
-                }
+            if (pos == -1) {
+                break;
+            }
+
+            if (actividades[pos].estado != PENDIENTE) {
+                continue;
+            }
+
+            if (iniciar_actividad(pos) == 0) {
+                ejecutando++;
+            } else {
+                actividades[pos].estado = FALLIDA;
+                abortar_rama(pos);
+                terminadas++;
             }
         }
 
-        // espera a que termine algun hijo
         if (ejecutando > 0) {
             int status;
             pid_t pid = waitpid(-1, &status, 0);
 
             if (pid > 0) {
-                terminar_actividad(pid, status);
+                procesar_hijo(pid, status);
                 ejecutando--;
-            } else if (pid == -1 && errno == EINTR) {
+                terminadas++;
+
                 continue;
-            } else if (pid == -1) {
+            }
+
+            if (pid == -1 && errno == EINTR) {
+                continue;
+            }
+
+            if (pid == -1) {
                 perror("waitpid");
                 break;
             }
-
-            continue;
         }
 
-        // si quedan pendientes y nadie puede empezar puede haber un ciclo
-        int pendientes = 0;
+        // cuenta abortadas para saber si ya termino todo
+        int resueltas = 0;
 
         for (int i = 0; i < cantidad; i++) {
-            if (actividades[i].estado == PENDIENTE) {
-                pendientes = 1;
-                break;
+            if (actividades[i].estado == TERMINADA ||
+                actividades[i].estado == FALLIDA ||
+                actividades[i].estado == ABORTADA) {
+
+                resueltas++;
             }
         }
 
-        if (pendientes) {
+        terminadas = resueltas;
+
+        if (ejecutando == 0 &&
+            inicio_cola >= fin_cola &&
+            hay_pendientes()) {
+
             fprintf(
                 stderr,
                 "No se puede continuar, puede haber un ciclo\n"
@@ -592,7 +674,7 @@ void ejecutar_plan(int k) {
 }
 
 
-char *texto_estado(int estado) {
+const char *texto_estado(int estado) {
     switch (estado) {
         case TERMINADA:
             return "TERMINADA";
@@ -612,7 +694,7 @@ char *texto_estado(int estado) {
 }
 
 
-// muestra como termino cada actividad
+// muestra el resultado final
 void mostrar_resumen(void) {
     printf("\n===== RESUMEN =====\n");
 
@@ -666,7 +748,7 @@ int main(int argc, char *argv[]) {
     }
 
     leer_plan(argv[1]);
-    revisar_dependencias();
+    preparar_dependencias();
 
     printf("Actividades cargadas: %d\n", cantidad);
     printf("Limite de procesos: %d\n\n", k);
@@ -674,6 +756,9 @@ int main(int argc, char *argv[]) {
     ejecutar_plan(k);
 
     mostrar_resumen();
+
+    free(aristas);
+    free(primera_arista);
 
     return EXIT_SUCCESS;
 }
