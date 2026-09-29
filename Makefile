@@ -1,11 +1,9 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c17 -lpthread
-TARGET = planificador
+CFLAGS = -Wall -Wextra -std=c17
+PROGRAMA = planificador
 
-all: $(TARGET)
-
-$(TARGET): planificador.c
-	$(CC) $(CFLAGS) planificador.c -o $(TARGET)
+all:
+	$(CC) $(CFLAGS) planificador.c -o $(PROGRAMA) -lpthread
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(PROGRAMA)
